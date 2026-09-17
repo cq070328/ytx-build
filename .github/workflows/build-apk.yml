@@ -1,0 +1,139 @@
+name: 云脱修 · 云端构建
+
+# 由 APP / 脚本触发，传入任务 ID（对应 Release 里的资源）
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: '任务 ID（Release tag）'
+        required: true
+      real_app:
+        description: '真实 Application 类名（可选，去壳用）'
+        required: false
+        default: ''
+      do_clean:
+        description: '是否去壳清理（1=是）'
+        required: false
+        default: '0'
+
+concurrency:
+  group: ytx-build-${{ github.event.inputs.task_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Python（系统自带）+ apksigner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip curl
+          # Android build-tools 的 apksigner（通过 sdkmanager 装太重，用 pip 版）
+          pip3 install --quiet apksig 2>/dev/null || true
+
+      - name: 下载 apktool
+        run: |
+          mkdir -p tools
+          curl -sSL -o tools/apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: 下载任务资源（Release assets）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TID="${{ github.event.inputs.task_id }}"
+          mkdir -p job
+          echo "下载 Release: $TID"
+          # 用 gh cli 下载该 tag 的所有 assets
+          gh release download "$TID" -D job --clobber || {
+            echo "❌ Release $TID 不存在或下载失败"; exit 1
+          }
+          ls -la job/
+
+      - name: 准备输入
+        run: |
+          TID="${{ github.event.inputs.task_id }}"
+          mkdir -p job/dump
+          # 解压 dump.zip（若有）
+          if [ -f job/dump.zip ]; then
+            unzip -o -q job/dump.zip -d job/dump
+          fi
+          ls -la job/
+          ls -la job/dump/ || true
+
+      - name: 去壳清理（可选）
+        if: ${{ github.event.inputs.do_clean == '1' }}
+        run: |
+          REAL="${{ github.event.inputs.real_app }}"
+          ARGS=""
+          if [ -n "$REAL" ]; then ARGS="--real-app $REAL"; fi
+          python3 tools/ytx-unpack-clean.py job/original.apk job/cleaned.apk \
+            --dump-dir job/dump $ARGS || echo "清理失败，继续用原 APK"
+          if [ -f job/cleaned.apk ]; then mv job/cleaned.apk job/original.apk; fi
+
+      - name: DEX 替换 + 对齐
+        run: |
+          python3 tools/ytx-dex-replace.py job/original.apk job/dump job/replaced.apk
+          python3 tools/ytx-zipalign.py job/replaced.apk job/aligned.apk
+
+      - name: 签名
+        run: |
+          # 生成 debug keystore（若不存在）
+          KS=tools/debug.keystore
+          if [ ! -f "$KS" ]; then
+            keytool -genkeypair -keystore "$KS" -alias ytx \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass ytx12345 -keypass ytx12345 \
+              -dname "CN=YunTuoXiu" -noprompt
+          fi
+          # 找 apksigner
+          if command -v apksigner >/dev/null 2>&1; then
+            SIGN=apksigner
+          else
+            # 下载 build-tools 的 apksigner（arm64/x86 通用 .jar wrapper）
+            curl -sSL -o tools/apksigner.jar \
+              https://raw.githubusercontent.com/patrickfav/uber-apk-signer/master/release/uber-apk-signer.jar || true
+            SIGN="java -jar tools/apksigner.jar"
+          fi
+          echo "sign tool: $SIGN"
+          if [ -f tools/apksigner.jar ]; then
+            java -jar tools/apksigner.jar --apks job/aligned.apk --out job/signed.apk \
+              2>/dev/null || cp job/aligned.apk job/signed.apk
+          else
+            apksigner sign --ks "$KS" --ks-pass pass:ytx12345 \
+              --key-pass pass:ytx12345 --ks-key-alias ytx \
+              --out job/signed.apk job/aligned.apk
+          fi
+          ls -la job/signed.apk
+
+      - name: 上传成品到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TID="${{ github.event.inputs.task_id }}"
+          OUT="$TID-out"
+          # 创建输出 Release（若不存在）
+          gh release view "$OUT" >/dev/null 2>&1 || \
+            gh release create "$OUT" --title "云脱修成品 $TID" --notes "自动构建产物"
+          gh release upload "$OUT" job/signed.apk --clobber
+          echo "✅ 上传完成: $OUT"
+
+      - name: 上传 artifact（备用）
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ytx-built-apk
+          path: job/signed.apk
+          if-no-files-found: error
+          retention-days: 7
